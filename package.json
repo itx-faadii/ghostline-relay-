@@ -1,0 +1,11 @@
+{
+  "name": "ghostline-signaling-relay",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node signaling_server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
