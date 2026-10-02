@@ -7,8 +7,8 @@ const maxMessageBytes = 64 * 1024;
 const registrationTimeoutMs = 10_000;
 const queueLimit = 20;
 const queueTtlMs = 60_000;
-const rateCapacity = 30;
-const rateRefillPerSecond = 10;
+const rateCapacity = 100;
+const rateRefillPerSecond = 20;
 const allowedMessageTypes = new Set([
   'register',
   'blind_join',
@@ -141,8 +141,21 @@ function verifyRegistration(peerId, encodedPublicKey, encodedSignature) {
 
 function startServer() {
   const server = new WebSocketServer({ port });
-
+     const heartbeat = setInterval(() => {
+    for (const client of server.clients) {
+      if (client.isAlive === false) {
+        client.terminate();
+        continue;
+      }
+      client.isAlive = false;
+      client.ping();
+    }
+  }, 15000);
+  server.on('close', () => clearInterval(heartbeat));
+  
   server.on('connection', (socket) => {
+      socket.isAlive = true;
+  socket.on('pong', () => { socket.isAlive = true; });
   socket.topics = new Set();
   socket.rate = {
     tokens: rateCapacity,
@@ -263,7 +276,8 @@ function startServer() {
 
   });
 
-  socket.on('close', () => {
+   socket.on('close', (code, reason) => {
+    console.log(`socket closed code=${code} reason=${reason.toString()}`);
     clearTimeout(socket.registrationTimer);
     removePeer(socket);
   });
@@ -274,7 +288,6 @@ function startServer() {
   });
 
   console.log(`GhostLine signaling relay listening on :${port}`);
-  return server;
 }
 
 export { verifyRegistration, startServer };
