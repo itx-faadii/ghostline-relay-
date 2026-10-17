@@ -9,15 +9,31 @@ const queueLimit = 20;
 const queueTtlMs = 60_000;
 const rateCapacity = 100;
 const rateRefillPerSecond = 20;
+
+// Offline store-and-forward. The broker holds opaque, already-encrypted message
+// blobs for peers that are not connected, and pushes them on registration. It
+// never sees plaintext, but it does now retain: recipient id, sender id, message
+// id, blob size and arrival time - which PRIVACY_POLICY.md and DEPLOY.md state.
+const storedLimitPerPeer = 500;
+const storedBytesPerPeer = 8 * 1024 * 1024;
+const storedBytesTotal = 64 * 1024 * 1024;
+// Kept below what a 64 KB frame can carry so an oversized store is answered with
+// an error instead of the whole signaling socket being closed at 1009.
+const storedBlobMaxBytes = 40 * 1024;
+const storedTtlMs = 7 * 24 * 60 * 60 * 1000;
+const storedPurgeIntervalMs = 10 * 60 * 1000;
+
 const allowedMessageTypes = new Set([
   'register',
   'blind_join',
   'blind_signal',
   'signal',
+  'store',
 ]);
 const peers = new Map();
 const topics = new Map();
 const queuedSignals = new Map();
+const storedMessages = new Map();
 
 function send(socket, message) {
   if (socket.readyState === socket.OPEN) {
@@ -73,6 +89,85 @@ function flushQueuedSignals(peerId, socket) {
   for (const entry of queued) {
     if (entry.expiresAt > now) send(socket, entry.message);
   }
+}
+
+function storedSizeBytes(entries) {
+  return entries.reduce((total, entry) => total + entry.bytes, 0);
+}
+
+function purgeStored() {
+  const now = Date.now();
+  for (const [peerId, entries] of storedMessages) {
+    const alive = entries.filter((entry) => entry.expiresAt > now);
+    if (alive.length === 0) storedMessages.delete(peerId);
+    else if (alive.length !== entries.length) storedMessages.set(peerId, alive);
+  }
+}
+
+function totalStoredBytes() {
+  let total = 0;
+  for (const entries of storedMessages.values()) total += storedSizeBytes(entries);
+  return total;
+}
+
+function evictOldestStored() {
+  let oldestPeerId = null;
+  let oldest = Infinity;
+  for (const [peerId, entries] of storedMessages) {
+    if (entries.length === 0) continue;
+    if (entries[0].receivedAt < oldest) {
+      oldest = entries[0].receivedAt;
+      oldestPeerId = peerId;
+    }
+  }
+  if (oldestPeerId === null) return false;
+  const entries = storedMessages.get(oldestPeerId);
+  entries.shift();
+  if (entries.length === 0) storedMessages.delete(oldestPeerId);
+  return true;
+}
+
+function storeMessage(to, from, messageId, blob) {
+  const now = Date.now();
+  const bytes = Math.floor((blob.length * 3) / 4);
+  const entries = (storedMessages.get(to) || [])
+    .filter((entry) => entry.expiresAt > now);
+  // A sender that retries the same message must not make the peer decrypt it
+  // twice, and the client already deduplicates by message id.
+  if (entries.some((entry) => entry.messageId === messageId)) {
+    return { stored: true, duplicate: true };
+  }
+  entries.push({ messageId, from, blob, bytes, receivedAt: now,
+                 expiresAt: now + storedTtlMs });
+  storedMessages.set(to, entries);
+  while (entries.length > storedLimitPerPeer ||
+         storedSizeBytes(entries) > storedBytesPerPeer) {
+    entries.shift();
+  }
+  while (totalStoredBytes() > storedBytesTotal) {
+    if (!evictOldestStored()) break;
+  }
+  if (entries.length === 0) storedMessages.delete(to);
+  return { stored: true, duplicate: false };
+}
+
+function flushStoredMessages(peerId, socket) {
+  const entries = storedMessages.get(peerId) || [];
+  if (entries.length === 0) return;
+  const now = Date.now();
+  // Dropped one at a time: if the link dies partway through the rest are still
+  // here for the next registration rather than lost with the socket.
+  while (entries.length > 0 && socket.readyState === socket.OPEN) {
+    const entry = entries.shift();
+    if (entry.expiresAt <= now) continue;
+    send(socket, {
+      type: 'stored',
+      from: entry.from,
+      messageId: entry.messageId,
+      blob: entry.blob,
+    });
+  }
+  if (entries.length === 0) storedMessages.delete(peerId);
 }
 
 function verifyRegistration(peerId, encodedPublicKey, encodedSignature) {
@@ -152,6 +247,10 @@ function startServer() {
     }
   }, 15000);
   server.on('close', () => clearInterval(heartbeat));
+
+  const purgeTimer = setInterval(purgeStored, storedPurgeIntervalMs);
+  purgeTimer.unref();
+  server.on('close', () => clearInterval(purgeTimer));
   
   server.on('connection', (socket) => {
       socket.isAlive = true;
@@ -210,6 +309,7 @@ function startServer() {
       peers.set(message.peerId, socket);
       send(socket, { type: 'registered', peerId: message.peerId });
       flushQueuedSignals(message.peerId, socket);
+      flushStoredMessages(message.peerId, socket);
       return;
     }
 
@@ -258,7 +358,10 @@ function startServer() {
         return;
       }
       const recipient = peers.get(message.to);
-      if (recipient) {
+      // A socket still listed but already closing accepts nothing, and `send`
+      // drops silently - so the fallback queue is what keeps the signal alive
+      // until the peer re-registers.
+      if (recipient && recipient.readyState === recipient.OPEN) {
         send(recipient, {
           type: 'signal',
           from: socket.peerId,
@@ -271,6 +374,49 @@ function startServer() {
           payload: message.payload,
         });
       }
+      return;
+    }
+
+    if (message.type === 'store') {
+      if (typeof socket.peerId !== 'string' ||
+          typeof message.to !== 'string' ||
+          message.to.length < 8 ||
+          typeof message.messageId !== 'string' ||
+          message.messageId.length > 128 ||
+          typeof message.blob !== 'string' ||
+          Math.floor((message.blob.length * 3) / 4) > storedBlobMaxBytes) {
+        send(socket, { type: 'error', code: 'invalid_store' });
+        return;
+      }
+      const recipient = peers.get(message.to);
+      if (recipient && recipient.readyState === recipient.OPEN) {
+        // Online: hand it over now instead of keeping a copy the sender has
+        // already been told about.
+        send(recipient, {
+          type: 'stored',
+          from: socket.peerId,
+          messageId: message.messageId,
+          blob: message.blob,
+        });
+        send(socket, {
+          type: 'stored_ack',
+          messageId: message.messageId,
+          delivered: true,
+        });
+        return;
+      }
+      const result = storeMessage(
+        message.to,
+        socket.peerId,
+        message.messageId,
+        message.blob,
+      );
+      send(socket, {
+        type: 'stored_ack',
+        messageId: message.messageId,
+        delivered: false,
+        duplicate: result.duplicate,
+      });
       return;
     }
 
