@@ -298,9 +298,17 @@ function startServer() {
         socket.close(1008, 'invalid peer id');
         return;
       }
-      if (peers.has(message.peerId) && peers.get(message.peerId) !== socket) {
-        socket.close(1008, 'peer id already connected');
-        return;
+      // The signature above was verified against the identity key that hashes to
+      // this peer id, so this socket proves it owns the id. Refusing it instead
+      // of taking over locked a device out of its own mailbox: a phone that lost
+      // its socket on a network handover - routine on Android - could not
+      // re-register until the 15-second heartbeat sweep freed the dead socket,
+      // and in that window it neither collected its queue nor sent. The queue and
+      // the pending signals are keyed by peer id, so nothing is lost here.
+      const incumbent = peers.get(message.peerId);
+      if (incumbent && incumbent !== socket) {
+        incumbent.terminate();
+        peers.delete(message.peerId);
       }
       removePeer(socket);
       clearTimeout(socket.registrationTimer);
