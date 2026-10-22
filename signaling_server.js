@@ -170,7 +170,21 @@ function flushStoredMessages(peerId, socket) {
   if (entries.length === 0) storedMessages.delete(peerId);
 }
 
-function verifyRegistration(peerId, encodedPublicKey, encodedSignature) {
+// The signed string must match what the client builds in `SignalingClient`.
+function registrationPayload(peerId, challenge) {
+  return `GHOSTLINE-REGISTER-v1|${peerId}|${challenge}`;
+}
+
+// The signature covers the nonce this socket minted, not the peer id alone, so a
+// captured register frame cannot be replayed on a later socket to claim another
+// device's mailbox. Only Ed25519 is accepted: one peer id hashing from one key
+// type means a P-256 certificate can never claim an Ed25519 identity.
+function verifyRegistration(
+  peerId,
+  encodedPublicKey,
+  encodedSignature,
+  challenge,
+) {
   try {
     const publicKey = Buffer.from(encodedPublicKey, 'base64url');
     const signature = Buffer.from(encodedSignature, 'base64url');
@@ -187,46 +201,19 @@ function verifyRegistration(peerId, encodedPublicKey, encodedSignature) {
       return false;
     }
 
-    if (publicKey.length === 32) {
-      const ed25519Key = crypto.createPublicKey({
-        key: Buffer.concat([
-          Buffer.from('302a300506032b6570032100', 'hex'),
-          publicKey,
-        ]),
-        format: 'der',
-        type: 'spki',
-      });
-      return crypto.verify(null, claimedFingerprint, ed25519Key, signature);
-    }
-
-    let encodedKey = publicKey;
-    if (publicKey.length === 65 && publicKey[0] === 0x04) {
-      encodedKey = Buffer.concat([
-        Buffer.from(
-          '3059301306072a8648ce3d020106082a8648ce3d030107034200',
-          'hex',
-        ),
+    if (publicKey.length !== 32 || typeof challenge !== 'string') return false;
+    const ed25519Key = crypto.createPublicKey({
+      key: Buffer.concat([
+        Buffer.from('302a300506032b6570032100', 'hex'),
         publicKey,
-      ]);
-    } else if (publicKey.length !== 91 || publicKey[0] !== 0x30) {
-      return false;
-    }
-
-    const p256Key = crypto.createPublicKey({
-      key: encodedKey,
+      ]),
       format: 'der',
       type: 'spki',
     });
-    const dsaEncoding = signature[0] === 0x30
-      ? 'der'
-      : signature.length === 64
-          ? 'ieee-p1363'
-          : null;
-    if (dsaEncoding === null) return false;
     return crypto.verify(
-      'sha256',
-      claimedFingerprint,
-      { key: p256Key, dsaEncoding },
+      null,
+      Buffer.from(registrationPayload(peerId, challenge), 'utf8'),
+      ed25519Key,
       signature,
     );
   } catch {
@@ -256,6 +243,10 @@ function startServer() {
       socket.isAlive = true;
   socket.on('pong', () => { socket.isAlive = true; });
   socket.topics = new Set();
+  // Fresh per socket, never reused and dropped once used, so the registration
+  // signature is only ever valid on the connection it was minted for.
+  socket.challenge = crypto.randomBytes(16).toString('base64url');
+  send(socket, { type: 'challenge', nonce: socket.challenge });
   socket.rate = {
     tokens: rateCapacity,
     updatedAt: Date.now(),
@@ -290,14 +281,24 @@ function startServer() {
     }
 
     if (message.type === 'register') {
+      const challenge = socket.challenge;
       if (typeof message.peerId !== 'string' ||
           message.peerId.length < 8 ||
           typeof message.identityKey !== 'string' ||
           typeof message.signature !== 'string' ||
-          !verifyRegistration(message.peerId, message.identityKey, message.signature)) {
+          typeof challenge !== 'string' ||
+          message.challenge !== challenge ||
+          !verifyRegistration(
+            message.peerId,
+            message.identityKey,
+            message.signature,
+            challenge,
+          )) {
         socket.close(1008, 'invalid peer id');
         return;
       }
+      // Spent: the same frame cannot re-verify on this socket either.
+      socket.challenge = null;
       // The signature above was verified against the identity key that hashes to
       // this peer id, so this socket proves it owns the id. Refusing it instead
       // of taking over locked a device out of its own mailbox: a phone that lost

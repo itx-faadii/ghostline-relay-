@@ -246,10 +246,10 @@ echo | openssl s_client -connect relay.yourdomain.com:443 2>/dev/null \
 
 | Property | Value |
 |---|---|
-| **Message content** | Never seen in plaintext — every `store` blob arrives already encrypted by the sender's Double Ratchet and is never decrypted here |
+| **Message content** | Never seen in plaintext — every `store` blob arrives sealed by the sender against the recipient's static offline key (`OfflineEnvelopeCipher`, ephemeral X25519 → HKDF-SHA256 → AES-256-GCM). It is deliberately **not** the Double Ratchet, and is never decrypted here |
 | **Data retained** | Offline store-and-forward only: opaque blobs until the recipient registers, then dropped. Bounded at 500 messages / 8 MB per recipient, 64 MB across the process, 40 KB per blob, 7-day TTL (purged every 10 minutes). Restarting the relay loses every undelivered blob |
 | **Metadata retained while queued** | Recipient Connection ID, sender Connection ID, sender-chosen message id, blob size, arrival time |
-| **Identity** | The relay verifies Ed25519 peer signatures on register only to prevent ID squatting |
+| **Identity** | The relay mints a fresh 16-byte nonce per socket and accepts `register` only with an Ed25519 signature over `GHOSTLINE-REGISTER-v1\|<peerId>\|<challenge>`, spent after one use. A captured frame therefore cannot be replayed on a later socket to claim another device's mailbox, and only Ed25519 is accepted so no other key type can claim an id. **Consequence: a client predating this exchange cannot register at all** — both peers and the relay must run the same generation |
 | **Rate limiting** | Max 64 KB per signaling message enforced in `signaling_server.js` |
 | **Peer count** | In-memory only; resets on server restart |
 
